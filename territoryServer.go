@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -29,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-redis/redis"
 	"github.com/llgcode/draw2d/draw2dimg"
+	"github.com/lucasb-eyer/go-colorful"
 )
 
 const (
@@ -95,6 +97,11 @@ func (v VirtualBounds) BoundingBox() quadtree.BoundingBox {
 	}
 }
 
+type ColorConfiguration struct {
+	Name  string
+	Color string
+}
+
 // RedisConfiguration holds Atlas database configuration
 type RedisConfiguration struct {
 	Name     string
@@ -114,6 +121,8 @@ type Configuration struct {
 	WWWDir               string               // Directory holding generated images
 	FetchRateInSeconds   int                  // Polling rate
 	DatabaseConnections  []RedisConfiguration // Databases config
+	Colors               []ColorConfiguration // Colors config
+	TribeColorOverride   map[string]string    // Override colors for specific tribes
 	ServersX             int                  // Number of servers in X dim
 	ServersY             int                  // Number of servers in Y dim
 	GameSize             int                  // Number of pixels for in-game images
@@ -141,48 +150,11 @@ func (c *Configuration) getDatabaseByName(name string) RedisConfiguration {
 }
 
 var config Configuration
-var colors = [...]string{
-	"red",
-	"green",
-	"yellow",
-	"blue",
-	"orange",
-	"purple",
-	"cyan",
-	"magenta",
-	"lime",
-	"pink",
-	"teal",
-	"lavender",
-	"brown",
-	"beige",
-	"maroon",
-	"olive",
-	"coral",
-	"navy",
-}
-var colorValues = map[string]color.NRGBA{
-	"black":    color.NRGBA{0x00, 0x00, 0x00, 0xff},
-	"grey":     color.NRGBA{0xa9, 0xa9, 0xa9, 0xff},
-	"red":      color.NRGBA{0xff, 0x00, 0x00, 0xff},
-	"green":    color.NRGBA{0x00, 0x80, 0x00, 0xff},
-	"yellow":   color.NRGBA{0xff, 0xff, 0x00, 0xff},
-	"blue":     color.NRGBA{0x00, 0x00, 0xff, 0xff},
-	"orange":   color.NRGBA{0xff, 0xa5, 0x00, 0xff},
-	"purple":   color.NRGBA{0x80, 0x00, 0x80, 0xff},
-	"cyan":     color.NRGBA{0x00, 0xff, 0xff, 0xff},
-	"magenta":  color.NRGBA{0xff, 0x00, 0xff, 0xff},
-	"lime":     color.NRGBA{0x00, 0xff, 0x00, 0xff},
-	"pink":     color.NRGBA{0xff, 0xc0, 0xcb, 0xff},
-	"teal":     color.NRGBA{0x00, 0x80, 0x80, 0xff},
-	"lavender": color.NRGBA{0xe6, 0xe6, 0xfa, 0xff},
-	"brown":    color.NRGBA{0xa5, 0x2a, 0x2a, 0xff},
-	"beige":    color.NRGBA{0xf5, 0xf5, 0xdc, 0xff},
-	"maroon":   color.NRGBA{0x80, 0x00, 0x00, 0xff},
-	"olive":    color.NRGBA{0x80, 0x80, 0x00, 0xff},
-	"coral":    color.NRGBA{0xff, 0x7f, 0x50, 0xff},
-	"navy":     color.NRGBA{0x00, 0x00, 0x80, 0xff},
-}
+var randomColors []colorful.Color
+var randomColorsLock sync.RWMutex
+var colorValues = make(map[string]color.Color)
+var tribeColorMap = make(map[uint64]color.Color)
+var tribeColorMapLock sync.RWMutex
 
 func loadConfig(path string) (cfg Configuration, err error) {
 	var file *os.File
@@ -218,6 +190,16 @@ func loadConfig(path string) (cfg Configuration, err error) {
 				Password: "foobared",
 			},
 		},
+		Colors: []ColorConfiguration{
+			{
+				Name:  "black",
+				Color: "#000000",
+			},
+			{
+				Name:  "gray",
+				Color: "#808080",
+			},
+		},
 		ServersX:          3,
 		ServersY:          3,
 		GameSize:          2048,
@@ -241,6 +223,10 @@ func loadConfig(path string) (cfg Configuration, err error) {
 
 	if len(cfg.AtlasS3KeyPrefix) > 0 && !strings.HasSuffix(cfg.AtlasS3KeyPrefix, "/") {
 		cfg.AtlasS3KeyPrefix += "/"
+	}
+
+	for _, colorConfig := range cfg.Colors {
+		colorValues[colorConfig.Name], err = colorful.Hex(colorConfig.Color)
 	}
 
 	return
@@ -271,16 +257,31 @@ func isTribeID(tribeID uint64) bool {
 }
 
 // getTribeColor returns a consistent color for a given tribe id
-func getTribeColor(tribeID uint64) color.NRGBA {
+func getTribeColor(tribeID uint64) color.Color {
 	if tribeID == 0 {
 		return colorValues["black"]
 	}
+
 	if !isTribeID(tribeID) {
 		return colorValues["gray"]
 	}
-	idx := int(tribeID % uint64(len(colors)))
-	color := colors[idx]
-	return colorValues[color]
+
+	if tribeOverrideColor, ok := config.TribeColorOverride[strconv.FormatUint(tribeID, 10)]; ok {
+		tribeOverrideColorParsed, _ := colorful.Hex(tribeOverrideColor)
+		return tribeOverrideColorParsed
+	}
+
+	tribeColorMapLock.RLock()
+	defer tribeColorMapLock.RUnlock()
+	if tribeColor, ok := tribeColorMap[tribeID]; ok {
+		return tribeColor
+	}
+
+	idx := int(tribeID % uint64(len(randomColors)))
+
+	randomColorsLock.RLock()
+	defer randomColorsLock.RUnlock()
+	return randomColors[idx]
 }
 
 // MapOptions holds map construction information
@@ -407,9 +408,10 @@ func generateImage(opts *MapOptions, quadTree *quadtree.QuadTree) {
 		}
 
 		// render marker
-		color := getTribeColor(vb.marker.tribeOrOwnerID)
-		gc.SetStrokeColor(color)
-		gc.SetFillColor(color)
+		markerColor := getTribeColor(vb.marker.tribeOrOwnerID)
+
+		gc.SetStrokeColor(markerColor)
+		gc.SetFillColor(markerColor)
 		gc.ArcTo(iX, iY, iRadius, iRadius, 0.0, 2*math.Pi)
 		gc.Fill()
 	}
@@ -791,6 +793,53 @@ func (f *fileHandlerWithCacheControl) ServeHTTP(w http.ResponseWriter, r *http.R
 	f.fileServer.ServeHTTP(w, r)
 }
 
+func getColors(responseWriter http.ResponseWriter, request *http.Request) {
+	log.Println(request.Method, request.URL.Path)
+	responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if request.Method != "POST" {
+		responseWriter.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := ioutil.ReadAll(request.Body)
+
+	if err != nil {
+		log.Println(err)
+		responseWriter.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	log.Println(string(body))
+
+	var tribeIDs []uint64
+	err = json.Unmarshal(body, &tribeIDs)
+
+	if err != nil {
+		log.Println(err)
+		responseWriter.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	var tribeColorMap = make(map[uint64]string)
+
+	for _, tribeID := range tribeIDs {
+		red, green, blue, _ := getTribeColor(tribeID).RGBA()
+		tribeColorMap[tribeID] = fmt.Sprintf("rgb(%d,%d,%d)", uint8(red/0x101), uint8(green/0x101), uint8(blue/0x101))
+	}
+
+	jsonResponse, err := json.Marshal(tribeColorMap)
+
+	if err != nil {
+		log.Println(err)
+		responseWriter.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	responseWriter.Header().Set("Content-Type", "application/json")
+	_, _ = responseWriter.Write(jsonResponse)
+}
+
 // Min helper faster than float math.Min in Go
 func Min(x, y int) int {
 	if x < y {
@@ -807,6 +856,67 @@ func Max(x, y int) int {
 	return y
 }
 
+func scan(client *redis.Client, pattern string) map[string]map[string]string {
+	records := make(map[string]map[string]string)
+
+	start := time.Now()
+
+	// Scan is slower than Keys but provides gaps for other things to execute
+	var keys []string
+	iter := client.Scan(0, pattern, 5000).Iterator()
+	for iter.Next() {
+		keys = append(keys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Load each entity
+	results := make(map[string]*redis.StringStringMapCmd)
+	pipe := client.Pipeline()
+	for _, id := range keys {
+		results[id] = pipe.HGetAll(id)
+	}
+	pipe.Exec()
+	for _, id := range keys {
+		records[id], _ = results[id].Result()
+	}
+
+	elapsed := time.Since(start)
+	log.Printf("Redis scan took %s", elapsed)
+
+	return records
+}
+
+func getTribeColors(client *redis.Client) {
+	for {
+		tribes := make(map[string]bool)
+
+		for _, record := range scan(client, "tribedata:*") {
+			tribes[record["TribeID"]] = true
+		}
+
+		// Don't generate new colors unless we have new tribes
+		if len(tribes) != len(randomColors) {
+			randomColorsLock.Lock()
+			randomColors = colorful.FastHappyPalette(len(tribes))
+			randomColorsLock.Unlock()
+
+			index := 0
+
+			tribeColorMapLock.Lock()
+			for tribeID := range tribes {
+				convertedTribeID, _ := strconv.ParseUint(tribeID, 10, 64)
+				tribeColorMap[convertedTribeID] = randomColors[index]
+				index++
+			}
+			tribeColorMapLock.Unlock()
+		}
+
+		time.Sleep(time.Duration(config.FetchRateInSeconds) * time.Second)
+	}
+}
+
 func main() {
 	var err error
 
@@ -815,6 +925,8 @@ func main() {
 		log.Printf("Warning: %v", err)
 		log.Println("Failed to read configuration file: config.json")
 	}
+
+	rand.Seed(int64(config.ServersX + config.ServersY))
 
 	defaultDbCfg := config.getDatabaseByName("Default")
 	defaultClient := redis.NewClient(&redis.Options{
@@ -830,6 +942,8 @@ func main() {
 		DB:       0,
 	})
 
+	go getTribeColors(defaultClient)
+
 	if config.EnableTileGeneration {
 		go tileBackgroundWorker(dbClient)
 	}
@@ -837,6 +951,7 @@ func main() {
 		go gameBackgroundWorker(dbClient, defaultClient)
 	}
 
+	http.HandleFunc("/colors", getColors)
 	http.Handle("/", &fileHandlerWithCacheControl{fileServer: http.FileServer(http.Dir(config.WWWDir))})
 
 	endpoint := fmt.Sprintf(":%d" /*config.Host,*/, config.Port)
